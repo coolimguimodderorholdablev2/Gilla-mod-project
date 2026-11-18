@@ -1,0 +1,189 @@
+// Gilla VR (com.playgilla.gilla) - build 1: crash logger + runtime IL2CPP dump
+#include <android/log.h>
+#include <dlfcn.h>
+#include <signal.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <unwind.h>
+#include <pthread.h>
+#include <cstdint>
+#include <string>
+#include <cstdio>
+#include <cstring>
+#include <ctime>
+
+#define TAG "QuestMod"
+#define LOG(...) __android_log_print(ANDROID_LOG_INFO, TAG, __VA_ARGS__)
+
+static const char* DL  = "/sdcard/Download/";
+static const char* PKG = "/sdcard/Android/data/com.playgilla.gilla/files/";
+
+static const char* S(const char* s) { return s ? s : ""; }
+
+static FILE* open_out(const char* name) {
+    std::string p = std::string(DL) + name;
+    FILE* f = fopen(p.c_str(), "w");
+    if (!f) { p = std::string(PKG) + name; f = fopen(p.c_str(), "w"); }
+    return f;
+}
+
+struct BT { void** cur; void** end; };
+static _Unwind_Reason_Code unwind_cb(_Unwind_Context* c, void* arg) {
+    BT* bt = (BT*)arg;
+    uintptr_t pc = _Unwind_GetIP(c);
+    if (pc) {
+        if (bt->cur == bt->end) return _URC_END_OF_STACK;
+        *bt->cur++ = (void*)pc;
+    }
+    return _URC_NO_REASON;
+}
+
+static void crash_handler(int sig, siginfo_t* si, void* ctx) {
+    char name[96];
+    snprintf(name, sizeof name, "crash_%ld.txt", (long)time(nullptr));
+    std::string p = std::string(DL) + name;
+    int fd = open(p.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0666);
+    if (fd < 0) {
+        p = std::string(PKG) + name;
+        fd = open(p.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0666);
+    }
+    if (fd >= 0) {
+        char buf[512];
+        int n = snprintf(buf, sizeof buf, "Signal %d (%s) code=%d fault_addr=%p\n",
+                         sig, strsignal(sig), si->si_code, si->si_addr);
+        write(fd, buf, n);
+
+        void* frames[64];
+        BT bt{frames, frames + 64};
+        _Unwind_Backtrace(unwind_cb, &bt);
+        for (void** f = frames; f < bt.cur; ++f) {
+            Dl_info info{};
+            if (dladdr(*f, &info) && info.dli_fname) {
+                n = snprintf(buf, sizeof buf, "  #%ld pc %p  %s+0x%lx  (%s)\n",
+                             (long)(f - frames), *f, info.dli_fname,
+                             (unsigned long)((uintptr_t)*f - (uintptr_t)info.dli_fbase),
+                             info.dli_sname ? info.dli_sname : "?");
+            } else {
+                n = snprintf(buf, sizeof buf, "  #%ld pc %p\n", (long)(f - frames), *f);
+            }
+            write(fd, buf, n);
+        }
+        const char* hdr = "\n--- /proc/self/maps ---\n";
+        write(fd, hdr, strlen(hdr));
+        int m = open("/proc/self/maps", O_RDONLY);
+        if (m >= 0) {
+            ssize_t r;
+            while ((r = read(m, buf, sizeof buf)) > 0) write(fd, buf, r);
+            close(m);
+        }
+        close(fd);
+    }
+    signal(sig, SIG_DFL);
+    raise(sig);
+}
+
+static void install_crash_handler() {
+    static char altstack[64 * 1024];
+    stack_t ss{};
+    ss.ss_sp = altstack;
+    ss.ss_size = sizeof altstack;
+    sigaltstack(&ss, nullptr);
+    struct sigaction sa{};
+    sa.sa_sigaction = crash_handler;
+    sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
+    sigemptyset(&sa.sa_mask);
+    for (int s : {SIGSEGV, SIGABRT, SIGBUS, SIGILL, SIGFPE, SIGTRAP})
+        sigaction(s, &sa, nullptr);
+}
+
+typedef void*       (*t_domain_get)();
+typedef void*       (*t_thread_attach)(void*);
+typedef void**      (*t_domain_get_assemblies)(void*, size_t*);
+typedef void*       (*t_assembly_get_image)(void*);
+typedef const char* (*t_image_get_name)(void*);
+typedef size_t      (*t_image_get_class_count)(void*);
+typedef void*       (*t_image_get_class)(void*, size_t);
+typedef const char* (*t_class_get_name)(void*);
+typedef const char* (*t_class_get_namespace)(void*);
+typedef void*       (*t_class_get_methods)(void*, void**);
+typedef void*       (*t_class_get_fields)(void*, void**);
+typedef const char* (*t_method_get_name)(void*);
+typedef uint32_t    (*t_method_get_param_count)(void*);
+typedef const char* (*t_field_get_name)(void*);
+typedef size_t      (*t_field_get_offset)(void*);
+
+static void dump_il2cpp() {
+    void* h = nullptr;
+    for (int i = 0; i < 120 && !h; ++i) {
+        h = dlopen("libil2cpp.so", RTLD_NOLOAD);
+        if (!h) sleep(1);
+    }
+    if (!h) { LOG("libil2cpp.so not found"); return; }
+    sleep(15);
+
+#define SYM(T, n) auto n = (T)dlsym(h, "il2cpp_" #n); \
+    if (!n) { LOG("missing il2cpp_" #n); return; }
+    SYM(t_domain_get, domain_get)
+    SYM(t_thread_attach, thread_attach)
+    SYM(t_domain_get_assemblies, domain_get_assemblies)
+    SYM(t_assembly_get_image, assembly_get_image)
+    SYM(t_image_get_name, image_get_name)
+    SYM(t_image_get_class_count, image_get_class_count)
+    SYM(t_image_get_class, image_get_class)
+    SYM(t_class_get_name, class_get_name)
+    SYM(t_class_get_namespace, class_get_namespace)
+    SYM(t_class_get_methods, class_get_methods)
+    SYM(t_class_get_fields, class_get_fields)
+    SYM(t_method_get_name, method_get_name)
+    SYM(t_method_get_param_count, method_get_param_count)
+    SYM(t_field_get_name, field_get_name)
+    SYM(t_field_get_offset, field_get_offset)
+
+    void* dom = domain_get();
+    thread_attach(dom);
+
+    Dl_info di{};
+    dladdr((void*)dlsym(h, "il2cpp_domain_get"), &di);
+    uintptr_t base = (uintptr_t)di.dli_fbase;
+
+    FILE* out = open_out("game_dump.txt");
+    if (!out) { LOG("cannot open dump file"); return; }
+    fprintf(out, "// libil2cpp base: %p\n\n", (void*)base);
+
+    size_t count = 0;
+    void** asms = domain_get_assemblies(dom, &count);
+    for (size_t a = 0; a < count; ++a) {
+        void* img = assembly_get_image(asms[a]);
+        fprintf(out, "// ===== %s =====\n", S(image_get_name(img)));
+        size_t cc = image_get_class_count(img);
+        for (size_t c = 0; c < cc; ++c) {
+            void* k = image_get_class(img, c);
+            fprintf(out, "\nclass %s.%s\n{\n", S(class_get_namespace(k)), S(class_get_name(k)));
+            void* it = nullptr;
+            void* f;
+            while ((f = class_get_fields(k, &it)))
+                fprintf(out, "    field %s; // offset 0x%zx\n",
+                        S(field_get_name(f)), field_get_offset(f));
+            it = nullptr;
+            void* m;
+            while ((m = class_get_methods(k, &it))) {
+                void* fn = *(void**)m;
+                fprintf(out, "    %s(params:%u); // RVA 0x%lx\n",
+                        S(method_get_name(m)), method_get_param_count(m),
+                        fn ? (unsigned long)((uintptr_t)fn - base) : 0UL);
+            }
+            fprintf(out, "}\n");
+        }
+        fflush(out);
+    }
+    fclose(out);
+    LOG("dump finished");
+}
+
+static void* dump_thread(void*) { dump_il2cpp(); return nullptr; }
+
+__attribute__((constructor)) static void init() {
+    install_crash_handler();
+    pthread_t t;
+    pthread_create(&t, nullptr, dump_thread, nullptr);
+}
